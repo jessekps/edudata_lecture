@@ -119,10 +119,6 @@ verbAggrData[1:10,1:10]
 
 
 
-# kolommen: person, gender, anger, situation, behavior, response
-
-
-
 # Relational data ---------------------------------------------------------
 
 # 1 fact, 1 place, 1 time
@@ -143,7 +139,7 @@ verbAggrData[1:10,1:10]
 # In dexter it works like this
 
 db = start_new_project(verbAggrRules, 
-                       ':memory:',
+                       db_name = ':memory:',
                        person_properties = list(gender='unknown', anger=as.integer(NA)))
 
 add_booklet(db, verbAggrData, 'VA questionnaire')
