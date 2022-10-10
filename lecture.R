@@ -296,3 +296,80 @@ filenames[2]
 df2 = read_messy_csv(filenames[2], header=F)
 filenames[3]
 df3 = read_messy_csv(filenames[3], header=F)
+
+
+
+# second lecture ----------------------------------------------------------
+
+# coding
+
+# assume data.frame handling (dplyr, tidyr) is known:
+
+# maybe some lacunes, we'll discuss
+
+# 1) abstraction
+# 2) regular expressions
+# 3) working with lists
+# then work through assignment
+
+
+# Regular expression basics
+
+# I gebruik altijd:
+# basic reference:
+# https://www.w3schools.com/jsref/jsref_obj_regexp.asp
+# reminder lookahead, lookbehind:
+# https://www.regular-expressions.info/lookaround.html
+
+# In R
+# double \\ in string
+
+# matching
+grepl('^\\d{4}[A-Z]{2}$','457TD',perl=TRUE)
+
+# replacement
+gsub('\\d{4}[A-Z]{2}','postcode', 'dit is een 6457TD denk ik',perl=TRUE)
+
+# extraction
+
+library(stringr)
+
+str_extract('dit is een 6457TD denk ik die ik eruit wil','\\d{4}[A-Z]{2}')
+
+
+# working with lists
+# goal (usually) getting to data.frame ready data
+
+# common pattern:
+
+lapply(lst, function(elem) { }) |> bind_rows()
+
+# zelfde voor een named list (bijv. de listnames zijn schooltypes) waar schooltype een niuewe kolom moet worden
+
+lapply(lst, function(elem) { }) |> bind_rows(.id='schooltype')
+
+# other common patterns
+
+# getting information about (list) elements within lists in a vector
+# usually an intermediate step in getting to a dataframe
+# e.g. length of vectors in a list
+
+elem_length = sapply(lst, length)
+
+# now make one data.frame with some element specific infromation added, e.g.
+
+tibble(name = rep(names(lst),elem_length), content = unlist(lst))
+
+# apply (over columns or rows of a matrix or data.frame), get a list, one element per row or column in the original
+
+# rows
+apply(x,1,function(row){ }, simplify=FALSE)
+
+# columns
+apply(x,2,function(col){ }, simplify=FALSE)
+
+
+
+
+
+
