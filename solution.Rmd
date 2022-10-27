@@ -1,0 +1,472 @@
+---
+title: "Refset Lezen oplossing"
+author: "Jesse Koops"
+date: "9/23/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(echo = TRUE, message=FALSE)
+library(printr)
+
+library(xml2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(stringi)
+library(dexter)
+
+# data waar:
+url = 'http://www.toetsspecials.nl/html/referentiesets_openbaar/taal.shtm'
+doc = read_html(url)
+
+# het is leesvaardigheid maar wordt taal genoemd
+
+filenames = xml_find_all(doc, "//a[contains(@href,'csv') ]/@href") %>% 
+  xml_text() %>%
+  paste0('http://www.toetsspecials.nl', .)
+
+
+# functie om de csv's te lezen
+# see ?read.csv2 for the ... arguments
+read_messy_csv = function(file_url, ...)
+{
+  tmp = tempfile(fileext='.csv')
+  download.file(url=file_url, destfile=tmp)
+  # het probleem is missende cellen aan het eind van de rijen
+  # gelukkig zijn er geen strings met quotes, dus deze simpele fix werkt
+  l = readLines(tmp)
+  sp = str_count(l,';')
+  ncol = max(sp)
+  l = paste0(l, sapply(ncol-sp, function(x) paste0(rep(';',x), collapse='')))
+  writeLines(l,tmp)
+  
+  read.csv2(tmp, ...) 
+}
+
+```
+
+# De data
+
+We lezen data in van de [referentiesets taal](http://www.toetsspecials.nl/html/referentiesets_openbaar/taal.shtm). Deze bestaat uit designs, scorebestanden en antwoordbestanden opgesplitst naar afnamepopulatie in een csv format. Er ontbreekt een sleutelbestand. Het gaat om de volgende bestanden:
+
+```{r}
+filenames
+```
+
+# Designs
+
+Er zijn 7 design bestanden, in eerste instantie lezen we die in als elementen in een list. De eerste regels en kolommen van `r filenames[1]` zien er als volgt uit:
+
+```{r}
+dsg = lapply(filenames[grepl('design\\.csv$',filenames)], read_messy_csv, header=FALSE)
+
+dsg[[1]][1:5,1:10]
+```
+
+De eerste kolom lijkt het boekjesnummer, de volgende kolommen bevatten item id's. Boekjes hebben verschillende lengtes. Er zijn geen boekjesnummers die meer dan één keer voorkomen ongeacht het bestand.
+
+```{r}
+lapply(dsg, '[[', 1) |> unlist() |> anyDuplicated()
+```
+
+Dit format voor de designs is onhandig. We maken eerst van elk element een long format tibble en vervolgens zetten we deze allen onder elkaar in één tibble (data.frame).
+
+```{r}
+design = lapply(dsg,function(booklet_dsg)
+{
+  items = apply(booklet_dsg[,-1], 1, function(x) x[!is.na(x) & x!=""])
+  n_items = sapply(items, length)
+  item_position = sapply(items, seq_along)
+  
+  tibble(test.versie = rep(booklet_dsg[[1]], n_items),
+         item_id = unlist(items),
+         item_position = unlist(item_position))
+}) |>
+  bind_rows()
+
+head(design)
+```
+
+
+Nou is het heel goed mogelijk, zelfs gebruikelijk, dat hetzelfde toetsboekje een verschillend versienummer krijgt als het bij een andere populatie wordt afgenomen. Dat is om verschillende redenen onhandig, je krijgt bijvoorbeeld minder per boekje en extra boekjes om te bekijken bij een TIA. Datamodel-technisch is het ook gewoon fout want we definiëren een boekje als een unieke set items in een bepaalde volgorde. Een boekje bekijen per populatie kan altijd nog.
+
+Verschillendetest.versies verwijzen dus mogelijk naar dezelfde boekjes. Om dit te controleren zullen we de boekjes en nieuwe identificatie moeten geven zodanig dat boekjes met dezelfde items hetzelfde id krijgen. Een natuurlijke oplossing is om de (gesorteerde) item id's achter elkaar te plakken, dit geeft gegarandeerd de juiste key. Alleen worden booklet_id's dan onnodig lang, dit kunnen we korter maken door vervolgens een factor of dense_rank te gebruiken.  
+
+
+```{r}
+booklets = design %>%
+  group_by(test.versie) %>%
+  arrange(item_position) %>%
+  summarise(booklet_id = paste(item_id, collapse='--')) %>%
+  ungroup() %>%
+  mutate(booklet_id = sprintf("bk%03i", dense_rank(booklet_id)))
+
+# aantal test.versies
+nrow(booklets)
+
+#aantal booklets
+n_distinct(booklets$booklet_id)
+```
+
+
+# Scores
+
+De score bestanden staan in een zogenaamd extended format. Dat betekent dat er een kolom is voor elk item en een rij voor elke leerling. Niet beantwoorde vragen zijn leeg of NA. De eerste regels en kolommen van het eerste bestand zien er als volgt uit:
+
+```{r}
+scores = lapply(filenames[grepl('extended\\.csv$',filenames)], read_messy_csv, header=TRUE)
+
+scores[[1]][1:5,1:12]
+```
+
+Voordat we hiermee verder gaan bewaren we de identificatie variabelen. Deze hebben we later nodig.
+
+```{r}
+ids_scores = lapply(scores, '[', c('test.versie','school.label','student.label')) %>%
+  bind_rows()
+```
+
+
+De verschillende bestanden hebben niet dezelfde aantallen kolommen.
+
+```{r}
+sapply(scores,ncol) 
+```
+
+Dit betekent dat rechtstreeks koppelen met `rbind` onhandig is. We zetten de afzonderlijke data.frames eerst om in een long format. Hierbij is het raadzaam om eerst een rijnummer toe te voegen aan de wide formats zodat er een koppeling blijft aan de oorspronkelijke bestanden, in geval we iets terug moeten communiceren. Zo maken we ook een basis voor een uniek persoons id als die niet in de data beschikbaar is.
+
+```{r}
+scores = lapply(scores, function(s)
+{
+  s$row_nbr = 1:nrow(s)
+  pivot_longer(s,cols = !c('test.versie','school.label','student.label','row_nbr'),
+               names_to='item_id', values_to='item_score') %>%
+    filter(!is.na(item_score))
+}) 
+
+head(scores[[1]])
+```
+
+Omdat alle elementen nu dezelfde kolommen/variabelen hebben kunnen we deze eenvoudig samenvoegen. Hierbij willen we wel graag bewaren uit welk bestand, en dus welk schooltype, de leerlingen komen. Deze halen we uit de bestandsnamen. Merk op dat school_type + row_nbr een persoons id is.
+
+```{r}
+names(scores) = filenames[grepl('extended\\.csv$',filenames)] %>%
+  str_extract("[^_]+(?=_extended)")
+
+scores = bind_rows(scores, .id='school_type')
+
+head(scores)
+```
+
+# Antwoorden
+
+De antwoord bestanden hebben geen kolomnamen. Het lijkt er op dat de eerste drie kolommen dezelfde zijn als bij de scorebestanden. In de kolommen daarna staan de antwoorden dan waarschijnlijk geordend naar het design van de boekjes, het zogenaamde compressed format.
+
+```{r}
+antwoorden = lapply(filenames[grepl('antwoord\\.csv$',filenames)], read_messy_csv, header=FALSE)
+
+antwoorden[[1]][1:5,1:10]
+```
+
+We controleren of, afgaande op de identificatievariabelen, de leerlingen in de score en antwoordbestanden inderdaad in dezelfde volgorde staan.
+
+```{r}
+ids_antw = lapply(antwoorden, '[', 1:3) %>%
+  bind_rows()
+
+sapply(1:3, function(i) all(ids_antw[[i]] == ids_scores[[i]]))
+  
+```
+
+Dit lijkt het geval, we nemen dus aan dat er en gelijke leerlingordening is.
+
+Ook de antwoorden moeten we eerst in long format zetten voor we ze kunnen samenvoegen. Omdat de koppeling aan de item id's via designs zal moeten gaan hebben we per antwoord een test.versie en item positie nodig. Daarbij moeten we hopen dat de designs kloppen natuurlijk. Omdat elke rij potentieel een verschillend aantal antwoorden heeft zullen we op één of andere manier de item positie toe moeten voegen voordat we de data in long format zetten. Dit is mogelijk omdat de item positie een één op één relatie heeft met de kolomnummers. We geven de kolommen dus als naam hun positie (minus 3 omdat de eerste drie kolommen de id variabelen bevatten). We voegen ook weer een rij nummer toe. Een puntje waar ik zelf mee heb zitten knoeien is dat na de draai de niet aangeboden items zowel een lege string als een NA kunnen hebben (vandaar het filter statement).
+
+```{r}
+antwoorden = lapply(antwoorden, function(s)
+{
+  colnames(s) = c('test.versie','school.label','student.label', 1:(ncol(s)-3))
+  
+  s$row_nbr = 1:nrow(s)
+  
+  pivot_longer(s, cols = !c('test.versie','school.label','student.label','row_nbr'),
+               names_to = 'item_position', values_to = 'response') %>%
+    filter(!is.na(response) & response != "") %>%
+    mutate(item_position = as.integer(item_position), 
+           response = trimws(response))
+})
+
+```
+
+Nu kunnen we de antwoorden weer veilig samenvoegen.
+
+```{r}
+names(antwoorden) = filenames[grepl('antwoord\\.csv$',filenames)] %>%
+  str_extract("[^_]+(?=_antwoord)")
+
+antwoorden = bind_rows(antwoorden, .id='school_type')
+```
+
+We hebben een gelijk aantal antwoorden als scores, dit is hoopgevend:
+
+```{r}
+nrow(antwoorden) == nrow(scores)
+```
+
+# Combineren
+
+Als alles goed is kunnen we nu het design, de antwoorden en de scores combineren.
+
+```{r}
+antwoorden = mutate(antwoorden, person_id = sprintf("%s_%08i", school_type, row_nbr))
+scores = mutate(scores, person_id = sprintf("%s_%08i", school_type, row_nbr))
+
+responses = antwoorden %>% 
+  inner_join(design,by=c('test.versie','item_position')) %>%
+  inner_join(scores, by=c('test.versie','item_id','person_id'))
+
+```
+
+Dit gaat in ieder geval zonder foutmeldingen, helaas is het resultaat niet correct. In de join gaan rijen verloren,
+
+```{r}
+nrow(responses) == nrow(antwoorden)
+
+nrow(scores) - nrow(responses)
+```
+
+We zijn dus `r nrow(scores) - nrow(responses)` antwoorden kwijtgeraakt. We kunnen vrij makkelijk zien welke antwoorden we zijn kwijtgeraakt en op welke items:
+
+```{r}
+anti_join(scores,responses,by=c('test.versie','item_id','person_id')) %>%
+  count(item_id)
+```
+
+We zien ook een verschil in de set van items die voorkomt in het design en die in de scores. De onderstaande items komen wel voor in het design maar komen niet voor als kolomnaam in de score bestanden die we in hebben gelezen.
+
+```{r}
+setdiff(design$item_id, scores$item_id)
+```
+
+We tellen het aantal items per boekje in het design en in de antwoorden. Twee boekjes blijken een verschillend aantal items te hebben.
+
+```{r}
+ds_count = design %>%
+  count(test.versie, name='n_items.design')
+
+aw_count = antwoorden %>%
+  count(person_id,test.versie, name='n_items.antwoorden') %>%
+  distinct(test.versie, n_items.antwoorden)
+
+inner_join(aw_count,ds_count) %>% 
+  filter(n_items.design != n_items.antwoorden)
+```
+
+Als we kijken waar de twee problematische items voorkomen dan zijn dat ook deze twee boekjes.
+
+```{r}
+filter(design, item_id %in% c("T3F_54A","T3F_54B"))
+```
+
+Blijkbaar is T3F_54 gesplits in een A en een B variant in het design en de scores maar niet in de antwoorden (als je verder kijkt zie je zelfs dat dit item in sommige boekjes in het design wel is gesplitst maar in andere niet). Een oplossing lijkt om deze twee items in het design samen te voegen. Vervolgens moeten we dan de item positie weer herstellen. Dit deon we door de A/B items te hernomen naar het oorspornkelijke item_id, `distinct` te gebruiken op test.versie en item_id en vervolgens d egaten in item positie weg te halen door en dense_rank te gebruiken binnen het boekje. 
+
+```{r}
+design = design %>%
+  mutate(item_id = if_else(item_id %in% c("T3F_54A","T3F_54B"), "T3F_54", item_id)) %>%
+  distinct(test.versie, item_id, .keep_all=TRUE) %>%
+  group_by(test.versie) %>%
+  mutate(item_position = dense_rank(item_position)) |>
+  ungroup()
+```
+
+Omdat dit wellicht gevolgen heeft voor onze eerder aangepaste boekjes id's doen we die voor de zekerheid ook opnieuw.
+
+```{r}
+booklets = design %>%
+  group_by(test.versie) %>%
+  summarise(booklet_id=paste(item_id,collapse='-')) %>%
+  mutate(booklet_id = paste0('bk-',dense_rank(booklet_id)))
+```
+
+We maken opnieuw de inner join en dit lijkt te werken.
+
+```{r}
+responses = antwoorden %>% 
+  inner_join(design,by=c('test.versie','item_position')) %>%
+  inner_join(scores, by=c('test.versie','item_id','person_id'))
+
+nrow(responses) == nrow(scores)
+```
+
+Soms zie je in code left_join's, right_join's en full_join's staan. Die maskeren het bovenstaande probleem. Er is meestal geen goede reden om een andere dan een inner_join te gebruiken. Voor de volledigheid voegen we nog onze eigen verbeterde boekjes id's toe aan de data.
+
+
+```{r}
+responses = inner_join(responses, booklets, by='test.versie')
+```
+
+# Scoringsregels
+
+Op de genoemde website staat
+
+> De bestanden met de titel 'antwoord' bevatten van de meerkeuzevragen de antwoorden die leerlingen gegeven hebben. Met behulp van de sleutels kunt u deze bestanden nog zelf van scores voorzien.
+
+We lijken dan nu eindelijk zover dat we dat in praktijk kunnen brengen. De scoreregels zijn de unieke scores behorende bij elk antwoord op elke vraag. Een sleutel zou daarbij leidend zijn maar een sleutelbestand wordt niet gegeven. Achterin de pdf's met de items op de webstie staan een soort human-readable sleutels maar die zijn niet automatisch toe te passen op deze data. We zullen dus _post facto_ de sleutel moeten achterhalen door een mapping te maken tussen de scores en de antwoorden.
+
+
+```{r}
+rules = responses %>%
+  distinct(item_id,response,item_score)
+
+table(rules$item_score)
+```
+
+We nemen aan dat 99 een missing response aangeeft, die willen we dan wel graag voorzien van de score 0. Ik geef hem ook een begrijpelijker waarde.
+
+```{r}
+rules = mutate(rules,
+              response = if_else(item_score==99,'<missing>',response),
+              item_score = if_else(item_score==99,0L,item_score))
+```
+
+Als alles goed is kunnen we deze sleutels gebruiken om een dexter database mee op te zetten, dat blijkt alleen niet het geval.
+
+```{r,message=TRUE,error=TRUE}
+db = start_new_project(rules,'ref_taal.db')
+```
+
+Blijkbaar komen sommige responses vaker voor met een verschillende score.
+
+```{r}
+dupl = count(rules,item_id,response) %>%
+  filter(n>1)
+
+dupl
+```
+
+Het probleem lijkt bij MBO4 te liggen. Sommige antwoorden krijgen hier een andere score dan in de ander populaties en zelfs binnen MBO4 wordt niet consistent gescoord.
+
+```{r}
+responses %>%
+  semi_join(dupl, by=c('item_id','response')) %>%
+  count(item_id,response,school_type.x,item_score)
+```
+
+We besluiten om MBO4 te negeren bij het maken van de sleutels. DIt is een judgement call.
+
+```{r}
+rules = responses %>%
+  filter(!(school_type.x == 'MBO4' & item_id %in% dupl$item_id)) %>%
+  distinct(item_id,response,item_score) %>%
+  mutate(response = if_else(item_score==99,'<missing>',response),
+          item_score = if_else(item_score==99,0L,item_score))
+```
+
+En nu worden de sleutels wel geaccepteerd.
+
+```{r}
+db = start_new_project(rules,':memory:')
+```
+
+# Data importeren
+
+Omdat we MBO4 hebben weggelaten bij het bepalen van de scores is het mogelijk dat antwoorden die alleen in MBO4 voorkwamen niet in de sleutels terecht zijn gekomen. De kans dat dit correcte antwoorden betreft lijkt echter klein.
+
+We passen dezelfde missing codering toe op de antwoorden als we op de sleutels deden. De antwoorden kunnen vervolgens in long format ingelezen worden.
+
+```{r}
+responses = responses %>%
+  mutate(response = if_else(item_score==99,'<missing>',response)) %>%
+  select(person_id, booklet_id,item_id, response)
+```
+
+```{r,message=TRUE,error=TRUE}
+#een design voor dexter maken met het nieuwe boekjes id
+
+dex_design = design |>
+  inner_join(booklets,by='test.versie') |>
+  distinct(booklet_id,item_position,item_id)
+
+
+add_response_data(db, responses, design=dex_design)
+```
+
+Er blijkt 1 onbekend antwoord te zijn dat dan blijkbaar alleen bij MBO4 voorkwam. Dit lijkt duidelijk een fout antwoord (gezien het vraagteken), dus we vertellen dexter om het automatisch toe te voegen en fout te rekenen.
+
+```{r}
+add_response_data(db, responses, design=dex_design, auto_add_unknown_rules = TRUE)
+```
+
+Het is ook handig om de persoonsvariabelen die we hebben toe te voegen.
+
+```{r}
+pp = antwoorden %>%
+  select(person_id, school_type, school_label=school.label, student_label=student.label) %>%
+  distinct()
+
+add_person_properties(db,pp)
+```
+
+We kunnen ook nog even kijken of het een probleem was geweest als we de school en leerling identificatie in de score en antwoordbestanden serieus hadden genomen.
+
+```{r}
+n_distinct(pp$school_type, pp$school_label, pp$student_label)
+
+nrow(pp)
+```
+
+We zien dat de student labels niet uniek zijn binnen een school en opleidingstype. Of dit een verkeerde codering betreft of dat dezelfde leerling mogelijk meerdere toetsen heeft gemaakt is op grond van deze data niet te zeggen. Het is trouwens niet zo dat er rijen gedupliceerd zijn in de oorspronkelijke bestanden voor deze leerlingen.
+
+# Evaluatie
+
+Een reden om data publiek beschikbaar te maken is zodat analyses herhaalbaar en controleerbaar zijn. Aan deze opdracht zie je dat data publiek maken niet op zichzelf een voldoende voorwaarde is om de analyse herhaalbaar te maken. 
+
+Het meest foutgevoelige dat we hierboven hebben gedaan is het koppelen van de scores aan de item id's via de designs en item positie. Dit is zeer foutgevoelig, ook omdat een fout 'doortelt', en het bleek hierboven al dat de designs niet volledig juist waren gespecificeerd. Het probleem lijkt echter vooralsnog wel verholpen te zijn.
+
+De verschillen in scoring voor enkele vragen tussen MBO4 en andere schooltypes is ook zorgwekkend. De scoring lijkt automatisch gedaan. Als dat niet het geval was geweest zouden veel meer inconsistenties te verwachten zijn. Maar fouten in de automatische scoring van enkele items schaadt wel het vertrouwen in de scoring als geheel. Dat een item consistent gescoord is betekent niet automatisch dat het juist gescoord is.
+
+Wat we hierboven hebben gedaan is de items en antwoorden in een 'intern consistente' staat gebracht. Qua data management kun je vaak niet beter doen. Het heeft wel de voorkeur om dit zo vroeg mogelijk te doen in de dataflow. Hoe bewerkter de data reeds is, hoe moeilijker het wordt. 
+
+Eventuele overige problemen met deze dataset (ook daarvan zijn er genoeg) moeten statistisch worden onderzocht.
+
+# Analyse
+
+Als de data eenmaal in een fatsoenlijk format is is de analyse niet heel moeilijk. We kunnen bijvoorbeeld kijken naar een tia.
+
+```{r}
+tia = tia_tables(db)
+
+summary(tia$items$rir)
+```
+
+Dat ziet er niet geweldig uit. Er zal per item dan ook gekeken moeten worden naar mogelijke sleutelfouten. Verdere analyse van de tia's is zeer wenselijk. Met `r nrow(get_items(db))` items en `r nrow(tia$items)` item-boekje combinaties is dat nog een hele klus.
+
+We kijken nog even naar de vaardigheidsverdeling over de school types.
+
+```{r}
+f = fit_enorm(db)
+
+pv = plausible_values(db, f, covariates='school_type')
+
+library(ggplot2)
+library(ggridges)
+
+ggplot(pv, aes(x = PV1, y = school_type)) + 
+  geom_density_ridges()
+```
+
+Dat ziet er wel geloofwaardig uit. Er zijn dus geen hele grote rampen gebeurd.
+
+
+
+
+
+
+
+
+
+
