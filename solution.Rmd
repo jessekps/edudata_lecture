@@ -7,7 +7,7 @@ editor_options:
   chunk_output_type: console
 ---
 
-<style>td{padding-right:2em;}</style>
+<style>td,th{padding-right:2em;}</style>
 
 ```{r setup, include=FALSE}
 library(knitr)
